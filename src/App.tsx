@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import './App.css'
 import { getRound, getSeatAvailable, getSeat, reserveSeat, checkBooking, checkEvent } from './methods/allticket.methods'
 
@@ -51,6 +51,25 @@ function parseTicketLabelsFromHtml(htmlStr: string): Record<string, string> {
   return mapping;
 }
 
+function checkIfVipRequired(data: any): boolean {
+  if (!data) return false;
+  
+  // Try to find chkVipkey at various paths
+  const chkVip = data.chkVipkey || data.chkVipKey || 
+                 data.event_info?.chkVipkey || data.event_info?.chkVipKey || 
+                 data.data?.chkVipkey || data.data?.chkVipKey ||
+                 data.data?.event_info?.chkVipkey || data.data?.event_info?.chkVipKey ||
+                 data.event_ref?.chkVipkey || data.event_ref?.chkVipKey ||
+                 data.data?.event_ref?.chkVipkey || data.data?.event_ref?.chkVipKey || "";
+
+  if (chkVip === true) return true;
+  if (typeof chkVip === 'string') {
+    const clean = chkVip.trim().toUpperCase();
+    return clean.length > 0 && clean !== 'N' && clean !== 'FALSE' && clean !== 'NULL';
+  }
+  return false;
+}
+
 function App() {
   const [entries, setEntries] = useState<Entry[]>([])
   const [token, setToken] = useState<string>('')
@@ -95,6 +114,221 @@ function App() {
   const [performances, setPerformances] = useState<any[]>([])
   const [selectedPerformance, setSelectedPerformance] = useState<string>('')
   const [ticketLabels, setTicketLabels] = useState<Record<string, string>>({})
+  const [eventName, setEventName] = useState<string>(() => {
+    return localStorage.getItem('atk_event_name') || ''
+  })
+  const [hasVipKey, setHasVipKey] = useState<boolean>(false)
+  const hasVipKeyRef = useRef<boolean>(false)
+  const updateHasVipKey = (val: boolean) => {
+    if (val) {
+      setHasVipKey(true)
+      hasVipKeyRef.current = true
+    }
+  }
+  const handleStartBookingRef = useRef<any>(null)
+  const [preferredZone, setPreferredZone] = useState<string>(() => {
+    return localStorage.getItem('atk_preferred_zone') || ''
+  })
+  const updatePreferredZone = (val: string) => {
+    setPreferredZone(val)
+    localStorage.setItem('atk_preferred_zone', val)
+  }
+
+  // Auto-Scheduler States
+  const [schedulerEnabled, setSchedulerEnabled] = useState<boolean>(false)
+  const [targetTime, setTargetTime] = useState<number | null>(() => {
+    const saved = localStorage.getItem('atk_manual_target_time')
+    if (saved) {
+      const parsedDate = new Date(saved)
+      if (!isNaN(parsedDate.getTime())) {
+        return parsedDate.getTime()
+      }
+    }
+    return null
+  })
+  const [targetTimeStr, setTargetTimeStr] = useState<string>(() => {
+    return localStorage.getItem('atk_manual_target_time') || ''
+  })
+  const [timeSkew, setTimeSkew] = useState<number>(0)
+  const [schedulerStatus, setSchedulerStatus] = useState<string>('')
+  const [preCheckSeconds, setPreCheckSeconds] = useState<number>(5)
+  const [pollingInterval, setPollingInterval] = useState<number>(1000)
+  const [isPromoStatus, setIsPromoStatus] = useState<string>('')
+  const [useTimer, setUseTimer] = useState<boolean>(() => localStorage.getItem('atk_use_timer') === 'true')
+
+  const toggleUseTimer = (val: boolean) => {
+    setUseTimer(val)
+    localStorage.setItem('atk_use_timer', String(val))
+  }
+
+  const [manualTargetTimeStr, setManualTargetTimeStr] = useState<string>(() => {
+    return localStorage.getItem('atk_manual_target_time') || ''
+  })
+
+  const handleSetManualTime = (val: string) => {
+    setManualTargetTimeStr(val)
+    localStorage.setItem('atk_manual_target_time', val)
+    if (val) {
+      const parsedDate = new Date(val)
+      if (!isNaN(parsedDate.getTime())) {
+        setTargetTime(parsedDate.getTime())
+        setTargetTimeStr(val)
+      } else {
+        setTargetTime(null)
+        setTargetTimeStr('')
+      }
+    } else {
+      setTargetTime(null)
+      setTargetTimeStr('')
+    }
+  }
+
+  const [currentServerTimeDisplay, setCurrentServerTimeDisplay] = useState<string>('')
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const serverTimeMs = Date.now() + timeSkew
+      const date = new Date(serverTimeMs)
+      const hrs = String(date.getHours()).padStart(2, '0')
+      const mins = String(date.getMinutes()).padStart(2, '0')
+      const secs = String(date.getSeconds()).padStart(2, '0')
+      setCurrentServerTimeDisplay(`${hrs}:${mins}:${secs}`)
+    }, 200)
+    return () => clearInterval(timer)
+  }, [timeSkew])
+
+  // Scheduler Timer Effect
+  useEffect(() => {
+    if (!schedulerEnabled || !targetTime) {
+      setSchedulerStatus('')
+      return
+    }
+
+    logDebug(`Scheduler activated. Target: ${targetTimeStr || new Date(targetTime).toLocaleString()}, Sync Skew: ${timeSkew}ms`)
+    
+    let preCheckStarted = false
+    let pollIntervalId: any = null
+
+    const mainIntervalId = setInterval(() => {
+      // Current synchronized server time
+      const currentServerTime = Date.now() + timeSkew
+      const msRemaining = targetTime - currentServerTime
+
+      if (isPromoStatus === 'N') {
+        // Event is already open. We just count down to targetTime without polling.
+        if (msRemaining <= 0) {
+          logDebug(`[Scheduler] Target time reached for already open event. Starting booking...`)
+          setSchedulerStatus('Target time reached! Starting booking...')
+          clearInterval(mainIntervalId)
+          setSchedulerEnabled(false)
+          handleStartBookingRef.current(true)
+        } else {
+          const totalSecs = Math.max(0, Math.floor(msRemaining / 1000))
+          const hrs = Math.floor(totalSecs / 3600)
+          const mins = Math.floor((totalSecs % 3600) / 60)
+          const secs = totalSecs % 60
+
+          const hrsStr = String(hrs).padStart(2, '0')
+          const minsStr = String(mins).padStart(2, '0')
+          const secsStr = String(secs).padStart(2, '0')
+
+          setSchedulerStatus(`Waiting... Countdown: ${hrsStr}:${minsStr}:${secsStr} (until target time)`)
+        }
+      } else {
+        // Standard flow: event is still locked (isPromo === 'Y' or unknown)
+        if (msRemaining > preCheckSeconds * 1000) {
+          // Still waiting. Update status text
+          const totalSecs = Math.max(0, Math.floor(msRemaining / 1000))
+          const hrs = Math.floor(totalSecs / 3600)
+          const mins = Math.floor((totalSecs % 3600) / 60)
+          const secs = totalSecs % 60
+
+          const hrsStr = String(hrs).padStart(2, '0')
+          const minsStr = String(mins).padStart(2, '0')
+          const secsStr = String(secs).padStart(2, '0')
+
+          setSchedulerStatus(`Waiting... Countdown: ${hrsStr}:${minsStr}:${secsStr} (until pre-check)`)
+        } else {
+          // We are within the pre-check window (e.g. 5 seconds before target time)
+          if (!preCheckStarted) {
+            preCheckStarted = true
+            setSchedulerStatus(`Pre-checking started! Polling API check-event every 1s...`)
+            logDebug(`Entering pre-check window. Polling check-event...`)
+
+            const activeToken = token
+            const activePerformId = selectedPerformance || performId
+
+            const pollEvent = async () => {
+              try {
+                logDebug(`[Scheduler] Calling checkEvent...`)
+                const res = await checkEvent(activeToken, activePerformId)
+                
+                // VIP check inside scheduler polling
+                const isVipRequired = checkIfVipRequired(res)
+                if (isVipRequired) {
+                  logDebug(`[Scheduler] Concert requires VIP membership validation! Aborting...`)
+                  setSchedulerStatus('Aborted: VIP membership key required.')
+                  clearInterval(mainIntervalId)
+                  if (pollIntervalId) clearInterval(pollIntervalId)
+                  setSchedulerEnabled(false)
+                  updateHasVipKey(true)
+                  alert('คอนเสิร์ตนี้ต้องใช้รหัสสมาชิก (chkVipkey) ซึ่งขณะนี้บอทยังไม่รองรับการใส่หมายเลขสมาชิก')
+                  return
+                }
+
+                const isPromo = res?.data?.event_info?.isPromo || res?.data?.isPromo || res?.isPromo
+                
+                logDebug(`[Scheduler] checkEvent response isPromo=${isPromo}`)
+                setIsPromoStatus(isPromo || '')
+
+                if (isPromo === 'N') {
+                  logDebug(`[Scheduler] isPromo is N! Target event has opened! Starting booking process...`)
+                  setSchedulerStatus('Event OPEN! Starting booking...')
+                  
+                  // Clear intervals
+                  clearInterval(mainIntervalId)
+                  if (pollIntervalId) clearInterval(pollIntervalId)
+                  setSchedulerEnabled(false)
+
+                  // Run booking flow
+                  handleStartBookingRef.current(true)
+                } else {
+                  setSchedulerStatus(`Pre-checking... Event is still promo (isPromo=Y).`)
+                }
+              } catch (err: any) {
+                logDebug(`[Scheduler] Error during checkEvent polling: ${err.message}`)
+                setSchedulerStatus(`Error in poll: ${err.message}`)
+              }
+            }
+
+            // Run immediately once
+            pollEvent()
+            // Then run every 1 second
+            pollIntervalId = setInterval(pollEvent, pollingInterval)
+          }
+
+          // Check if we have passed the target time
+          if (msRemaining <= -1500) {
+            // If 1.5 seconds have passed after the target time and isPromo is still Y/not N, 
+            // let's force start booking to make sure we don't miss the window.
+            logDebug(`[Scheduler] Passed target time by 1.5s but isPromo is still promo or API slow. Forcing booking...`)
+            setSchedulerStatus('Target time reached! Forcing booking start...')
+            
+            clearInterval(mainIntervalId)
+            if (pollIntervalId) clearInterval(pollIntervalId)
+            setSchedulerEnabled(false)
+
+            handleStartBookingRef.current(true)
+          }
+        }
+      }
+    }, 100) // Check time every 100ms for high precision
+
+    return () => {
+      clearInterval(mainIntervalId)
+      if (pollIntervalId) clearInterval(pollIntervalId)
+    }
+  }, [schedulerEnabled, targetTime, timeSkew, preCheckSeconds, pollingInterval, token, selectedPerformance, performId])
 
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text)
@@ -109,6 +343,60 @@ function App() {
   const selectedRoundObject = rounds.find((r: any) => r.roundId === selectedRound)
   const targetPerformId = selectedPerformance || selectedRoundObject?.performId || performId
 
+  const [connectedTab, setConnectedTab] = useState<{ id?: number, url?: string, title?: string } | null>(null)
+
+  const getAllTicketTab = async (pId?: string): Promise<chrome.tabs.Tab | null> => {
+    if (typeof chrome === 'undefined' || !chrome.tabs || !chrome.tabs.query) {
+      return null;
+    }
+    try {
+      const tabs = await chrome.tabs.query({ url: "*://*.allticket.com/*" });
+      if (tabs && tabs.length > 0) {
+        const checkPerformId = pId || selectedPerformance || performId;
+        if (checkPerformId) {
+          const matched = tabs.find(t => t.url && t.url.includes(checkPerformId));
+          if (matched) return matched;
+        }
+
+        // Prioritize tabs with "/event/"
+        const eventTabs = tabs.filter(t => t.url && t.url.includes('/event/'));
+        if (eventTabs.length > 0) {
+          const activeEvent = eventTabs.find(t => t.active);
+          if (activeEvent) return activeEvent;
+          return eventTabs[0];
+        }
+
+        const activeAllTicket = tabs.find(t => t.active);
+        if (activeAllTicket) return activeAllTicket;
+        return tabs[0];
+      }
+      
+      const activeTabs = await chrome.tabs.query({ active: true });
+      for (const tab of activeTabs) {
+        if (tab && tab.url && tab.url.includes('allticket.com')) {
+          return tab;
+        }
+      }
+    } catch (err) {
+      console.warn('Failed to query allticket tab:', err);
+    }
+    return null;
+  };
+
+  useEffect(() => {
+    const updateConnectedTab = async () => {
+      const tab = await getAllTicketTab();
+      if (tab) {
+        setConnectedTab({ id: tab.id, url: tab.url, title: tab.title });
+      } else {
+        setConnectedTab(null);
+      }
+    };
+    updateConnectedTab();
+    const interval = setInterval(updateConnectedTab, 2000);
+    return () => clearInterval(interval);
+  }, [selectedPerformance, performId]);
+
   const logDebug = (msg: string) => {
     console.log(msg)
     setDebugLogs(prev => [...prev.slice(-49), `${new Date().toLocaleTimeString()}: ${msg}`])
@@ -122,10 +410,10 @@ function App() {
 
   const fetchInTab = async (url: string, method: string, headers: any, body?: string) => {
     logDebug(`fetchInTab: url=${url}, method=${method}, body=${body || ''}`)
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
+    const tab = await getAllTicketTab(performId || selectedPerformance)
     if (!tab) {
-      logDebug('fetchInTab error: No active tab found')
-      throw new Error('No active tab found')
+      logDebug('fetchInTab error: No active AllTicket tab found')
+      throw new Error('No active AllTicket tab found')
     }
 
     const results = await chrome.scripting.executeScript({
@@ -209,11 +497,13 @@ function App() {
   }
 
   useEffect(() => {
-    // Reset quiz when performId changes
+    // Reset quiz and VIP key when performId changes
     updateQuizResultKey('')
     setQuizQuestion(null)
     setSelectedAnswer(null)
-  }, [performId])
+    setHasVipKey(false)
+    hasVipKeyRef.current = false
+  }, [performId, selectedPerformance])
 
   useEffect(() => {
     extract()
@@ -234,10 +524,10 @@ function App() {
   }, [targetPerformId, eventConsents])
 
   const extract = async () => {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
+    const tab = await getAllTicketTab(performId || selectedPerformance)
 
-    if (!tab.url?.includes('allticket.com')) {
-      alert('Please navigate to an AllTicket page to extract data.')
+    if (!tab || !tab.url?.includes('allticket.com')) {
+      alert('Please open an AllTicket page in another browser tab first, then click Extract.')
       return
     }
 
@@ -309,6 +599,17 @@ function App() {
           const consentsList = eventInfoRes.data.data.event_ref.event_consent
           logDebug(`Auto-detected event consents list: ${JSON.stringify(consentsList)}`)
           setEventConsents(consentsList)
+        }
+        if (eventInfoRes?.data?.data?.event_full_name) {
+          const name = eventInfoRes.data.data.event_full_name
+          setEventName(name)
+          localStorage.setItem('atk_event_name', name)
+          logDebug(`Auto-detected event full name: ${name}`)
+        }
+        const eventData = eventInfoRes?.data?.data || {}
+        const isVipRequired = checkIfVipRequired(eventData) || checkIfVipRequired(eventInfoRes)
+        if (isVipRequired) {
+          logDebug(`WARNING: Concert requires chkVipkey membership verification! (Will show in UI after rounds load)`)
         }
         if (eventInfoRes?.data?.data?.infoHtml) {
           const labels = parseTicketLabelsFromHtml(eventInfoRes.data.data.infoHtml)
@@ -500,7 +801,52 @@ function App() {
       logDebug('handleGetRound: calling checkEvent...')
       const eventStatus = await checkEvent(activeToken, activePerformId)
       logDebug(`handleGetRound: checkEvent response=${JSON.stringify(eventStatus)}`)
+
+      // Auto-extract promoDate (ticket opening time) and sync server time
+      const isPromoVal = eventStatus?.data?.event_info?.isPromo || eventStatus?.data?.isPromo || eventStatus?.isPromo
+      setIsPromoStatus(isPromoVal || '')
+      
+      const serverTime = eventStatus?._serverTime || Date.now()
+      const clientTime = Date.now()
+      const skew = serverTime - clientTime
+      setTimeSkew(skew)
+      logDebug(`Server time skew calculated: ${skew}ms (Server: ${new Date(serverTime).toLocaleTimeString()}, Client: ${new Date(clientTime).toLocaleTimeString()})`)
+
+      const promoDateVal = eventStatus?.data?.event_info?.promoDate || 
+                           eventStatus?.data?.promoDate || 
+                           eventStatus?.event_info?.promoDate ||
+                           eventStatus?.promoDate ||
+                           eventStatus?.data?.event_info?.buyTicketDate ||
+                           eventStatus?.data?.buyTicketDate
+
+      if (promoDateVal) {
+        logDebug(`Found target sale start date from API: ${promoDateVal}`)
+        const cleanDateStr = typeof promoDateVal === 'string' ? promoDateVal.replace(/-/g, '/') : promoDateVal
+        const parsedDate = new Date(cleanDateStr)
+        if (!isNaN(parsedDate.getTime())) {
+          setTargetTime(parsedDate.getTime())
+          setTargetTimeStr(String(promoDateVal))
+          logDebug(`Successfully parsed opening time: ${parsedDate.toLocaleString()} (timestamp: ${parsedDate.getTime()})`)
+        } else {
+          logDebug(`Found date from API but failed to parse: ${promoDateVal}`)
+        }
+      } else {
+        logDebug(`No promoDate or buyTicketDate found in checkEvent API response`)
+      }
+
       const eventInfo = eventStatus?.data?.event_info || {}
+      let isVipRequired = checkIfVipRequired(eventStatus) || checkIfVipRequired(eventInfo)
+      if (isVipRequired) {
+        logDebug(`WARNING: Concert requires chkVipkey membership verification!`)
+      }
+
+      const fullEventName = eventStatus?.data?.event_full_name || eventInfo?.event_full_name || eventStatus?.event_full_name || ''
+      if (fullEventName) {
+        setEventName(fullEventName)
+        localStorage.setItem('atk_event_name', fullEventName)
+        logDebug(`Concert Name loaded from checkEvent API: ${fullEventName}`)
+      }
+
       const maxReserveLimit = eventInfo.maxSelectSeatPerUser || eventInfo.maxSelectSeat || eventInfo.maxReserve || 4
       setMaxSeatLimit(maxReserveLimit)
       logDebug(`Max seat limit set to: ${maxReserveLimit}`)
@@ -511,7 +857,7 @@ function App() {
 
       let activeLabels = ticketLabels
       if (Object.keys(activeLabels).length === 0) {
-        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
+        const tab = await getAllTicketTab(performId || selectedPerformance)
         const eventMatch = tab?.url?.match(/\/event\/([^/?#]+)/)
         const slug = eventMatch ? eventMatch[1] : null
         if (slug) {
@@ -519,6 +865,15 @@ function App() {
             const eventInfoRes = await fetchInTab(`https://www.allticket.com/master/event_info/${slug}.json?time=${Date.now()}`, 'GET', {
               'accept': 'application/json, text/plain, */*'
             })
+            if (eventInfoRes?.data?.data?.event_full_name) {
+              const name = eventInfoRes.data.data.event_full_name
+              setEventName(name)
+              localStorage.setItem('atk_event_name', name)
+            }
+            const eventData = eventInfoRes?.data?.data || {}
+            if (checkIfVipRequired(eventData) || checkIfVipRequired(eventInfoRes)) {
+              isVipRequired = true
+            }
             if (eventInfoRes?.data?.data?.infoHtml) {
               activeLabels = parseTicketLabelsFromHtml(eventInfoRes.data.data.infoHtml)
               setTicketLabels(activeLabels)
@@ -556,6 +911,7 @@ function App() {
       const firstPerf = perfList[0]
       setSelectedPerformance(firstPerf.performId)
       await handleFetchRounds(firstPerf, activeToken, bypassQuizCheck)
+      updateHasVipKey(isVipRequired)
     } catch (error: any) {
       alert('Error: ' + error.message)
       setPollingStatus('Error: ' + error.message)
@@ -798,6 +1154,11 @@ function App() {
   }
 
   const runReservationLoop = async (zoneReservations: any[]) => {
+    if (hasVipKeyRef.current) {
+      alert('คอนเสิร์ตนี้ต้องใช้รหัสสมาชิก (chkVipkey) ซึ่งขณะนี้บอทยังไม่รองรับการใส่หมายเลขสมาชิก')
+      setPollingStatus('Aborted: VIP membership key required.')
+      return
+    }
     setLoadingReserve(true)
     setReserveResult(null)
     setPollingStatus('Starting reservation...')
@@ -863,26 +1224,47 @@ function App() {
       let activeZone = selectedZone
 
       if (bookingMode === 'auto') {
-        // If no zone is selected, automatically pick the first zone that has enough seats
-        if (!activeZone) {
+        const isZoneAvailable = (z: any, seatAmount: number): boolean => {
+          const amtVal = z.amount;
+          if (amtVal === undefined || amtVal === null) return false;
+          if (typeof amtVal === 'number') {
+            return amtVal >= seatAmount;
+          }
+          const amtStr = String(amtVal).trim().toLowerCase();
+          if (amtStr === '0' || amtStr === 'เต็ม' || amtStr === 'sold out' || amtStr === 'soldout' || amtStr === 'หมด') {
+            return false;
+          }
+          const parsed = parseInt(amtStr, 10);
+          if (!isNaN(parsed)) {
+            return parsed >= seatAmount;
+          }
+          return true;
+        };
+
+        if (preferredZone && preferredZone.trim().length > 0) {
           const availableZones = availData?.data?.seat_available || []
-          const match = availableZones.find((z: any) => {
-            const amtVal = z.amount;
-            if (amtVal === undefined || amtVal === null) return false;
-            if (typeof amtVal === 'number') {
-              return amtVal >= botSeatAmount;
-            }
-            const amtStr = String(amtVal).trim().toLowerCase();
-            if (amtStr === '0' || amtStr === 'เต็ม' || amtStr === 'sold out' || amtStr === 'soldout' || amtStr === 'หมด') {
-              return false;
-            }
-            const parsed = parseInt(amtStr, 10);
-            if (!isNaN(parsed)) {
-              return parsed >= botSeatAmount;
-            }
-            // Standing/Festival zones typically return strings like "Available" or "มีที่ว่าง"
-            return true;
+          const cleanInput = preferredZone.trim().toUpperCase()
+          const matchedZone = availableZones.find((z: any) => {
+            const zid = String(z.id || '').trim().toUpperCase()
+            const zNameTh = String(z.nameTh || '').trim().toUpperCase()
+            const zNameEn = String(z.nameEn || '').trim().toUpperCase()
+            return zid === cleanInput || zNameTh === cleanInput || zNameEn === cleanInput
           })
+
+          if (!matchedZone) {
+            throw new Error(`ไม่พบโซน "${preferredZone}" ในระบบ กรุณาตรวจสอบและตั้งค่าโซนใหม่`)
+          }
+
+          if (!isZoneAvailable(matchedZone, botSeatAmount)) {
+            throw new Error(`โซน ${matchedZone.nameTh || matchedZone.id} เต็มแล้ว กรุณาจองใหม่`)
+          }
+
+          activeZone = matchedZone.id
+          setSelectedZone(activeZone)
+          logDebug(`Selected preferred Zone: ${activeZone}`)
+        } else if (!activeZone) {
+          const availableZones = availData?.data?.seat_available || []
+          const match = availableZones.find((z: any) => isZoneAvailable(z, botSeatAmount))
           if (match) {
             activeZone = match.id
             setSelectedZone(activeZone)
@@ -983,7 +1365,7 @@ function App() {
     }
   }
 
-  const handleStartBooking = async () => {
+  const handleStartBooking = async (isTriggeredByScheduler = false) => {
     if (!token) {
       alert('Token is required')
       return
@@ -994,7 +1376,137 @@ function App() {
       alert('Perform ID is required')
       return
     }
-    
+
+    // Pre-flight check (VIP check & time sync)
+    let currentSkew = timeSkew
+    let currentIsPromo = isPromoStatus
+    let currentTargetTime = targetTime
+    let currentTargetTimeStr = targetTimeStr
+
+    if (!isTriggeredByScheduler) {
+      setPollingStatus('Checking event config...')
+      try {
+        const eventStatus = await checkEvent(token, activePerfId)
+        
+        const isPromoVal = eventStatus?.data?.event_info?.isPromo || eventStatus?.data?.isPromo || eventStatus?.isPromo
+        currentIsPromo = isPromoVal || ''
+        setIsPromoStatus(currentIsPromo)
+
+        const serverTime = eventStatus?._serverTime || Date.now()
+        const clientTime = Date.now()
+        currentSkew = serverTime - clientTime
+        setTimeSkew(currentSkew)
+
+        const eventInfo = eventStatus?.data?.event_info || {}
+        const fullEventName = eventStatus?.data?.event_full_name || eventInfo?.event_full_name || eventStatus?.event_full_name || ''
+        if (fullEventName) {
+          setEventName(fullEventName)
+          localStorage.setItem('atk_event_name', fullEventName)
+        }
+
+        const isVipRequired = checkIfVipRequired(eventStatus) || checkIfVipRequired(eventInfo)
+        updateHasVipKey(isVipRequired)
+
+        if (isVipRequired) {
+          alert('คอนเสิร์ตนี้ต้องใช้รหัสสมาชิก (chkVipkey) ซึ่งขณะนี้บอทยังไม่รองรับการใส่หมายเลขสมาชิก')
+          setPollingStatus('Aborted: VIP membership key required.')
+          return
+        }
+
+        // Auto-detect target opening time if NOT set manually and not set in state yet
+        if (!currentTargetTime) {
+          let promoDateVal = eventStatus?.data?.event_info?.promoDate || 
+                             eventStatus?.data?.promoDate || 
+                             eventStatus?.event_info?.promoDate ||
+                             eventStatus?.promoDate ||
+                             eventStatus?.data?.event_info?.buyTicketDate ||
+                             eventStatus?.data?.buyTicketDate
+
+          // Fallback: Try to fetch rounds list
+          if (!promoDateVal) {
+            logDebug('Target time not found in checkEvent. Trying fallback to rounds list...')
+            try {
+              const roundsData = await getRound(token, activePerfId, quizResultKey)
+              const listRound = roundsData?.data?.event_info?.list_round || []
+              if (listRound.length > 0) {
+                const round = listRound[0]
+                const buyDate = round?.buyTicketDate || round?.buyTicketDateTh || round?.buyDate || round?.saleStartDate || round?.saleStartDateTh
+                const buyTime = round?.buyTicketTime || round?.buyTicketTimeTh || round?.buyTime || round?.saleStartTime || round?.saleStartTimeTh || "10:00:00"
+                if (buyDate) {
+                  let cleanDate = buyDate
+                  if (typeof buyDate === 'string' && buyDate.includes('/')) {
+                    const parts = buyDate.split('/')
+                    if (parts.length === 3 && parts[2].length === 4) {
+                      cleanDate = `${parts[2]}/${parts[1]}/${parts[0]}`
+                    }
+                  }
+                  promoDateVal = `${cleanDate} ${buyTime}`
+                }
+              }
+            } catch (roundErr) {
+              logDebug('Failed to fetch rounds for fallback target time')
+            }
+          }
+
+          if (promoDateVal) {
+            const cleanDateStr = typeof promoDateVal === 'string' ? promoDateVal.replace(/-/g, '/') : promoDateVal
+            const parsedDate = new Date(cleanDateStr)
+            if (!isNaN(parsedDate.getTime())) {
+              currentTargetTime = parsedDate.getTime()
+              currentTargetTimeStr = String(promoDateVal)
+              setTargetTime(currentTargetTime)
+              setTargetTimeStr(currentTargetTimeStr)
+            }
+          }
+        }
+      } catch (err: any) {
+        logDebug('Pre-flight config check failed: ' + err.message)
+      }
+    }
+
+    if (hasVipKeyRef.current) {
+      alert('คอนเสิร์ตนี้ต้องใช้รหัสสมาชิก (chkVipkey) ซึ่งขณะนี้บอทยังไม่รองรับการใส่หมายเลขสมาชิก')
+      return
+    }
+
+    // 1. If Timer mode is enabled, check target time and countdown FIRST!
+    if (useTimer && !isTriggeredByScheduler) {
+      // Override with manual time input if provided
+      if (manualTargetTimeStr) {
+        const parsedDate = new Date(manualTargetTimeStr)
+        if (!isNaN(parsedDate.getTime())) {
+          currentTargetTime = parsedDate.getTime()
+          currentTargetTimeStr = manualTargetTimeStr
+        }
+      }
+
+      if (!currentTargetTime) {
+        alert('Could not retrieve target opening time from API, and no manual time was specified. Please set a target time manually.')
+        return
+      }
+
+      // Make sure React states are synchronized so the countdown timer ticks
+      setTargetTime(currentTargetTime)
+      if (currentTargetTimeStr) {
+        setTargetTimeStr(currentTargetTimeStr)
+      }
+
+      const currentServerTime = Date.now() + currentSkew
+      if (currentServerTime < currentTargetTime) {
+        // Event has not opened yet (or is already open but target time is in the future). Start scheduler countdown!
+        setSchedulerEnabled(true)
+        logDebug(`Auto-Scheduler enabled (isPromo=${currentIsPromo}). Target: ${currentTargetTimeStr || new Date(currentTargetTime).toLocaleString()}`)
+        setPollingStatus('Scheduler active. Waiting for countdown...')
+        return
+      } else {
+        alert('เวลาเปิดจองที่ตั้งไว้ได้ผ่านพ้นไปแล้ว ไม่สามารถกดจองได้ กรุณาตั้งเวลาให้ถูกต้อง')
+        logDebug('Target opening time has already passed. Aborting scheduled booking.')
+        setPollingStatus('Aborted: Target time has already passed.')
+        return
+      }
+    }
+
+    // 2. Resolve or dynamically fetch concert rounds
     let activeRound = selectedRound
     if (!activeRound) {
       if (rounds.length > 0) {
@@ -1002,13 +1514,37 @@ function App() {
         setSelectedRound(activeRound)
         logDebug(`Auto-selected round: ${activeRound}`)
       } else {
-        alert('Please load Concert Rounds first')
-        return
+        logDebug('No rounds loaded. Fetching rounds automatically...')
+        setPollingStatus('Fetching rounds automatically...')
+        try {
+          // Fetch rounds directly from API to avoid async state issues
+          const roundsData = await getRound(token, activePerfId, quizResultKey)
+          const listRound = roundsData?.data?.event_info?.list_round || []
+          if (listRound.length > 0) {
+            const mapped = listRound.map((r: any) => ({ ...r, performId: activePerfId }))
+            setRounds(mapped)
+            activeRound = mapped[0].roundId
+            setSelectedRound(activeRound)
+            logDebug(`Automatically fetched and selected round: ${activeRound}`)
+          } else {
+            alert('Failed to automatically load rounds: list_round is empty.')
+            return
+          }
+        } catch (err: any) {
+          alert('Failed to automatically load rounds: ' + err.message)
+          return
+        }
       }
     }
 
     if (bookingMode === 'auto' && botSeatAmount > maxSeatLimit) {
       alert(`จำนวนที่นั่งระบุเกินที่กำหนด (สูงสุดได้ ${maxSeatLimit} ที่นั่งสำหรับคอนเสิร์ตนี้)`)
+      return
+    }
+
+    if (hasVipKeyRef.current) {
+      alert('คอนเสิร์ตนี้ต้องใช้รหัสสมาชิก (chkVipkey) ซึ่งขณะนี้บอทยังไม่รองรับการใส่หมายเลขสมาชิก')
+      setPollingStatus('Aborted: VIP membership key required.')
       return
     }
 
@@ -1218,6 +1754,8 @@ function App() {
 
     await runReservationLoop([payload])
   }
+  
+  handleStartBookingRef.current = handleStartBooking
 
   const toggleSeat = (seat: any, subZone: any) => {
     if (seat.status !== 'A') return
@@ -1245,6 +1783,7 @@ function App() {
 
   const zones = seatResult?.data?.seat_available || []
   const subZones = seatDetailResult?.data?.seats_available || []
+  const hasSeatZones = zones.length === 0 || zones.some((z: any) => z.type !== 'NONSEAT' && z.type !== 'NON_SEAT')
 
   // Group selected seats by sub-zone to prepare JSON structure
   const groupedReservation = selectedSeats.reduce((acc: any, curr: any) => {
@@ -1284,6 +1823,81 @@ function App() {
     <div className="app-container">
       {/* Left Column: Main Application Logic */}
       <div className="main-content">
+        {/* Standalone Tab/Window Helper Bar */}
+        <div style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          backgroundColor: '#f8fafc',
+          border: '1px solid #e2e8f0',
+          borderRadius: '6px',
+          padding: '6px 10px',
+          marginBottom: '10px',
+          fontSize: '10px',
+          fontWeight: '600',
+          color: '#475569'
+        }}>
+          <span>💡 Popup terminates when minimized.</span>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <span 
+              onClick={() => {
+                if (typeof chrome !== 'undefined' && chrome.tabs && chrome.tabs.create) {
+                  chrome.tabs.create({ url: chrome.runtime.getURL('index.html') })
+                }
+              }}
+              style={{ color: 'var(--primary)', cursor: 'pointer', textDecoration: 'underline' }}
+            >
+              🖥️ Open in Tab
+            </span>
+            <span 
+              onClick={() => {
+                if (typeof chrome !== 'undefined' && chrome.windows && chrome.windows.create) {
+                  chrome.windows.create({
+                    url: chrome.runtime.getURL('index.html'),
+                    type: 'popup',
+                    width: 480,
+                    height: 680
+                  })
+                }
+              }}
+              style={{ color: 'var(--primary)', cursor: 'pointer', textDecoration: 'underline' }}
+            >
+              🔲 Open in Window
+            </span>
+          </div>
+        </div>
+
+        {/* Connection Status Bar */}
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          backgroundColor: connectedTab ? '#ecfdf5' : '#fef2f2',
+          border: connectedTab ? '1px solid #a7f3d0' : '1px solid #fecaca',
+          borderRadius: '6px',
+          padding: '8px 12px',
+          marginBottom: '12px',
+          fontSize: '11px',
+          fontWeight: '500',
+          color: connectedTab ? '#065f46' : '#991b1b'
+        }}>
+          <span style={{
+            display: 'inline-block',
+            width: '8px',
+            height: '8px',
+            borderRadius: '50%',
+            backgroundColor: connectedTab ? '#10b981' : '#ef4444',
+            marginRight: '8px',
+            flexShrink: 0
+          }} />
+          {connectedTab ? (
+            <span style={{ textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap', maxWidth: '380px' }}>
+              🔗 Connected Tab: <strong>{connectedTab.title || connectedTab.url}</strong>
+            </span>
+          ) : (
+            <span>❌ No AllTicket tab found. Please open allticket.com/event/... in another tab.</span>
+          )}
+        </div>
+
         <h1 style={{ 
           fontSize: '18px', 
           fontWeight: 'bold', 
@@ -1415,13 +2029,56 @@ function App() {
                 fontSize: '8px', 
                 padding: '2px 6px', 
                 borderRadius: '9999px', 
-                backgroundColor: botRunning ? '#fee2e2' : '#f1f5f9', 
-                color: botRunning ? '#ef4444' : '#64748b',
+                backgroundColor: schedulerEnabled ? '#dcfce7' : botRunning ? '#fee2e2' : '#f1f5f9', 
+                color: schedulerEnabled ? '#15803d' : botRunning ? '#ef4444' : '#64748b',
                 fontWeight: 'bold'
               }}>
-                {botRunning ? 'BOT ACTIVE' : 'IDLE'}
+                {schedulerEnabled ? 'TIMER ACTIVE' : botRunning ? 'BOT ACTIVE' : 'IDLE'}
               </span>
             </div>
+
+            {/* Display Concert Name */}
+            {(eventName || (connectedTab && connectedTab.title && connectedTab.url?.includes('/event/')) || performId) ? (
+              <div style={{
+                marginTop: '6px',
+                fontSize: '10px',
+                fontWeight: '700',
+                color: '#4f46e5',
+                backgroundColor: '#e0e7ff',
+                padding: '4px 8px',
+                borderRadius: '4px',
+                border: '1px solid #c7d2fe',
+                lineHeight: '1.4',
+                wordBreak: 'break-word'
+              }}>
+                🎟️ Concert: <strong>
+                  {eventName 
+                    ? eventName 
+                    : (connectedTab && connectedTab.title && connectedTab.url?.includes('/event/')
+                        ? connectedTab.title.replace(/\s*-\s*All\s*Ticket/i, '').trim()
+                        : performId.replace(/_/g, ' ').trim()
+                      )
+                  }
+                </strong>
+              </div>
+            ) : null}
+
+            {/* Display VIP Key Warning */}
+            {hasVipKey && (
+              <div style={{
+                marginTop: '6px',
+                fontSize: '10px',
+                fontWeight: '700',
+                color: '#b91c1c',
+                backgroundColor: '#fee2e2',
+                padding: '6px 8px',
+                borderRadius: '4px',
+                border: '1px solid #fecaca',
+                lineHeight: '1.4'
+              }}>
+                ⚠️ คำเตือน: คอนเสิร์ตนี้ต้องใช้รหัสสมาชิก (chkVipkey) ซึ่งขณะนี้บอทยังไม่รองรับการใส่หมายเลขสมาชิก
+              </div>
+            )}
             
             <div style={{ display: 'flex', gap: '8px', marginTop: '6px' }}>
               <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '3px' }}>
@@ -1465,19 +2122,159 @@ function App() {
               )}
             </div>
 
+            {bookingMode === 'auto' && hasSeatZones && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', marginTop: '6px' }}>
+                <label style={{ fontSize: '9px', fontWeight: 'bold', color: '#4b5563' }}>
+                  Preferred Zone (ระบุโซน เช่น A2 - บอทจะเลือกที่นั่งในโซนนี้ให้อัตโนมัติ)
+                </label>
+                <input 
+                  type="text" 
+                  value={preferredZone} 
+                  onChange={(e) => updatePreferredZone(e.target.value)}
+                  placeholder="ตัวอย่าง: A2 (เว้นว่างไว้หากต้องการให้บอทหาโซนว่างอื่นแทน)"
+                  className="input-field"
+                  style={{ padding: '4px 6px', fontSize: '10px' }}
+                />
+              </div>
+            )}
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginTop: '8px' }}>
+              <input 
+                type="checkbox" 
+                id="use-timer"
+                checked={useTimer}
+                onChange={(e) => toggleUseTimer(e.target.checked)}
+                disabled={botRunning || schedulerEnabled}
+                style={{ cursor: 'pointer' }}
+              />
+              <label htmlFor="use-timer" style={{ fontWeight: '700', fontSize: '10px', color: '#4b5563', cursor: 'pointer', userSelect: 'none' }}>
+                🕒 Use Timer (ตั้งเวลาเปิดจองอัตโนมัติจาก API)
+              </label>
+            </div>
+
+            {useTimer && (
+              <div style={{ 
+                marginTop: '8px', 
+                padding: '8px', 
+                backgroundColor: '#f0f9ff', 
+                borderRadius: '6px', 
+                border: '1.5px solid #bae6fd', 
+                fontSize: '10px',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '4px'
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ color: '#0369a1', fontWeight: 'bold' }}>Target Opening (API):</span>
+                  <span style={{ fontWeight: '800', color: targetTimeStr ? '#0284c7' : '#dc2626' }}>
+                    {targetTimeStr ? targetTimeStr : 'Not detected'}
+                  </span>
+                </div>
+
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', marginTop: '2px', marginBottom: '2px' }}>
+                  <label style={{ fontSize: '9px', fontWeight: 'bold', color: '#0369a1' }}>
+                    ✍️ Set Target Time Manually (ตั้งเวลาจองเองถ้า API ไม่มีเวลาบอก)
+                  </label>
+                  <input 
+                    type="datetime-local" 
+                    step="1"
+                    value={manualTargetTimeStr}
+                    onChange={(e) => handleSetManualTime(e.target.value)}
+                    disabled={botRunning || schedulerEnabled}
+                    className="input-field"
+                    style={{ padding: '3px 5px', fontSize: '10px', height: '22px' }}
+                  />
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span style={{ color: '#0369a1', fontWeight: 'bold' }}>Server Time (AllTicket):</span>
+                  <span style={{ fontWeight: '800', color: '#0369a1', fontFamily: 'monospace' }}>
+                    {currentServerTimeDisplay ? currentServerTimeDisplay : 'Not Synced'}
+                  </span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span style={{ color: '#0369a1' }}>Server Time Skew:</span>
+                  <span style={{ fontWeight: '600', color: '#0369a1' }}>
+                    {timeSkew !== 0 ? `${timeSkew > 0 ? '+' : ''}${timeSkew} ms` : 'Not Synced'}
+                  </span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span style={{ color: '#0369a1' }}>Promo Status (isPromo):</span>
+                  <span style={{ 
+                    fontWeight: '800', 
+                    color: isPromoStatus === 'Y' ? '#ca8a04' : isPromoStatus === 'N' ? '#16a34a' : '#4b5563'
+                  }}>
+                    {isPromoStatus ? isPromoStatus : 'Unknown'}
+                  </span>
+                </div>
+
+                <div style={{ display: 'flex', gap: '6px', marginTop: '4px' }}>
+                  <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                    <label style={{ fontSize: '9px', fontWeight: 'bold', color: '#0369a1' }}>Start Polling (secs before)</label>
+                    <input 
+                      type="number"
+                      min={1}
+                      max={60}
+                      value={preCheckSeconds}
+                      onChange={(e) => setPreCheckSeconds(Math.max(1, Math.min(60, Number(e.target.value))))}
+                      disabled={botRunning || schedulerEnabled}
+                      className="input-field"
+                      style={{ padding: '3px 5px', fontSize: '9px' }}
+                    />
+                  </div>
+                  <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                    <label style={{ fontSize: '9px', fontWeight: 'bold', color: '#0369a1' }}>Polling Interval (ms)</label>
+                    <input 
+                      type="number"
+                      min={200}
+                      max={5000}
+                      value={pollingInterval}
+                      onChange={(e) => setPollingInterval(Math.max(200, Math.min(5000, Number(e.target.value))))}
+                      disabled={botRunning || schedulerEnabled}
+                      className="input-field"
+                      style={{ padding: '3px 5px', fontSize: '9px' }}
+                    />
+                  </div>
+                </div>
+
+                {schedulerStatus && (
+                  <div style={{
+                    marginTop: '4px',
+                    fontSize: '9px',
+                    fontWeight: '800',
+                    color: '#0369a1',
+                    textAlign: 'center',
+                    padding: '3px',
+                    backgroundColor: '#ffffff',
+                    borderRadius: '4px',
+                    border: '1px solid #bae6fd'
+                  }}>
+                    Timer: {schedulerStatus}
+                  </div>
+                )}
+              </div>
+            )}
+
             <div style={{ display: 'flex', gap: '6px', marginTop: '8px' }}>
               <button 
-                onClick={handleStartBooking}
-                disabled={botRunning || rounds.length === 0}
+                onClick={() => handleStartBooking(false)}
+                disabled={botRunning || schedulerEnabled}
                 className="btn btn-primary"
                 style={{ flex: 1, padding: '8px', fontWeight: '800', fontSize: '11px', textTransform: 'uppercase' }}
               >
-                {botRunning ? 'Processing Booking...' : '🚀 Start Automated Booking'}
+                {schedulerEnabled 
+                  ? '⏳ Waiting for Countdown...' 
+                  : botRunning 
+                    ? 'Processing Booking...' 
+                    : useTimer 
+                      ? '🚀 Start Scheduled Booking' 
+                      : '🚀 Start Automated Booking'}
               </button>
-              {botRunning && (
+              {(botRunning || schedulerEnabled) && (
                 <button 
                   onClick={() => {
                     setBotRunning(false);
+                    setSchedulerEnabled(false);
+                    setSchedulerStatus('Cancelled by user.');
                     setPollingStatus('Stopped by user.');
                   }}
                   className="btn btn-danger"

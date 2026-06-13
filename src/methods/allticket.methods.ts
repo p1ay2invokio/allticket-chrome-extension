@@ -1,5 +1,25 @@
+const getReferer = async (fallbackPerformId: string): Promise<string> => {
+  if (typeof chrome !== 'undefined' && chrome.tabs && chrome.tabs.query) {
+    try {
+      const tabs = await chrome.tabs.query({ url: "*://*.allticket.com/*" });
+      if (tabs && tabs.length > 0) {
+        const matched = tabs.find(t => t.url && t.url.includes(fallbackPerformId));
+        if (matched && matched.url) {
+          return matched.url;
+        }
+        if (tabs[0].url) {
+          return tabs[0].url;
+        }
+      }
+    } catch (err) {
+      console.warn('Failed to query tabs for referer:', err);
+    }
+  }
+  return `https://www.allticket.com/event/${fallbackPerformId}`;
+};
 
 export const getRound = async (authorization: string, performId: string, quizResultKey?: string) => {
+  const refererUrl = await getReferer(performId);
   const url = 'https://www.allticket.com/api-booking/get-round';
   const headers: Record<string, string> = {
     'accept': 'application/json, text/plain, */*',
@@ -10,7 +30,7 @@ export const getRound = async (authorization: string, performId: string, quizRes
     'origin': 'https://www.allticket.com',
     'pragma': 'no-cache',
     'priority': 'u=1, i',
-    'referer': 'https://www.allticket.com/event/NaraFest2026',
+    'referer': refererUrl,
     'sec-ch-ua': '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"macOS"',
@@ -49,6 +69,7 @@ export const getRound = async (authorization: string, performId: string, quizRes
 };
 
 export const getSeatAvailable = async (authorization: string, performId: string, roundId: string, quizResultKey?: string) => {
+  const refererUrl = await getReferer(performId);
   const url = 'https://www.allticket.com/api-booking/seat-available';
   const headers: Record<string, string> = {
     'accept': 'application/json, text/plain, */*',
@@ -59,7 +80,7 @@ export const getSeatAvailable = async (authorization: string, performId: string,
     'origin': 'https://www.allticket.com',
     'pragma': 'no-cache',
     'priority': 'u=1, i',
-    'referer': `https://www.allticket.com/event/${performId}`,
+    'referer': refererUrl,
     'sec-ch-ua': '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"macOS"',
@@ -99,6 +120,7 @@ export const getSeatAvailable = async (authorization: string, performId: string,
 };
 
 export const getSeat = async (authorization: string, performId: string, roundId: string, zoneId: string, quizResultKey?: string) => {
+  const refererUrl = await getReferer(performId);
   const url = 'https://www.allticket.com/api-booking/get-seat';
   const headers: Record<string, string> = {
     'accept': 'application/json, text/plain, */*',
@@ -109,7 +131,7 @@ export const getSeat = async (authorization: string, performId: string, roundId:
     'origin': 'https://www.allticket.com',
     'pragma': 'no-cache',
     'priority': 'u=1, i',
-    'referer': `https://www.allticket.com/event/${performId}`,
+    'referer': refererUrl,
     'sec-ch-ua': '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"macOS"',
@@ -150,6 +172,7 @@ export const getSeat = async (authorization: string, performId: string, roundId:
 };
 
 export const reserveSeat = async (authorization: string, atkZData: string, payload: any, quizResultKey?: string) => {
+  const refererUrl = await getReferer(payload.performId);
   const url = 'https://www.allticket.com/api-booking/handler-reserve';
   const headers: any = {
     'accept': 'application/json, text/plain, */*',
@@ -160,7 +183,7 @@ export const reserveSeat = async (authorization: string, atkZData: string, paylo
     'origin': 'https://www.allticket.com',
     'pragma': 'no-cache',
     'priority': 'u=1, i',
-    'referer': `https://www.allticket.com/event/${payload.performId}`,
+    'referer': refererUrl,
     'sec-ch-ua': '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"macOS"',
@@ -252,6 +275,7 @@ export const checkBooking = async (authorization: string, uuid: string, quizResu
 };
 
 export const checkEvent = async (authorization: string, performId: string) => {
+  const refererUrl = await getReferer(performId);
   const url = 'https://www.allticket.com/api-content/check-event';
   const headers = {
     'accept': 'application/json, text/plain, */*',
@@ -262,7 +286,7 @@ export const checkEvent = async (authorization: string, performId: string) => {
     'origin': 'https://www.allticket.com',
     'pragma': 'no-cache',
     'priority': 'u=1, i',
-    'referer': `https://www.allticket.com/event/${performId}`,
+    'referer': refererUrl,
     'sec-ch-ua': '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"macOS"',
@@ -288,7 +312,11 @@ export const checkEvent = async (authorization: string, performId: string) => {
       throw new Error(`HTTP error! status: ${response.status}`);
     }
 
+    const serverTimeHeader = response.headers.get('date');
     const data = await response.json();
+    if (data && typeof data === 'object') {
+      data._serverTime = serverTimeHeader ? new Date(serverTimeHeader).getTime() : Date.now();
+    }
     return data;
   } catch (error) {
     console.error('Error checking event:', error);
@@ -297,6 +325,7 @@ export const checkEvent = async (authorization: string, performId: string) => {
 };
 
 export const getQuestion = async (authorization: string, performId: string, qtoken: string) => {
+  const refererUrl = await getReferer(performId);
   const url = 'https://www.allticket.com/api-booking/quiz/get-question';
   const headers = {
     'accept': 'application/json, text/plain, */*',
@@ -308,7 +337,7 @@ export const getQuestion = async (authorization: string, performId: string, qtok
     'origin': 'https://www.allticket.com',
     'pragma': 'no-cache',
     'priority': 'u=1, i',
-    'referer': `https://www.allticket.com/event/${performId}`,
+    'referer': refererUrl,
     'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"macOS"',
@@ -350,6 +379,7 @@ export const checkAnswer = async (
   answerId: number,
   answerText: string
 ) => {
+  const refererUrl = await getReferer(performId);
   const url = 'https://www.allticket.com/api-booking/quiz/check-answer';
   const headers = {
     'accept': 'application/json, text/plain, */*',
@@ -361,7 +391,7 @@ export const checkAnswer = async (
     'origin': 'https://www.allticket.com',
     'pragma': 'no-cache',
     'priority': 'u=1, i',
-    'referer': `https://www.allticket.com/event/${performId}`,
+    'referer': refererUrl,
     'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"macOS"',
